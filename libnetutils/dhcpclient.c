@@ -36,8 +36,8 @@
 
 #include <dirent.h>
 
+#include <netutils/ifc.h>
 #include "dhcpmsg.h"
-#include "ifc_utils.h"
 #include "packet.h"
 
 #define VERBOSE 2
@@ -70,7 +70,7 @@ void printerr(char *fmt, ...)
     vsnprintf(errmsg, sizeof(errmsg), fmt, ap);
     va_end(ap);
 
-    LOGD("%s", errmsg);
+    ALOGD("%s", errmsg);
 }
 
 const char *dhcp_lasterror()
@@ -85,17 +85,15 @@ int fatal(const char *reason)
 //    exit(1);
 }
 
-const char *ipaddr(uint32_t addr)
+const char *ipaddr(in_addr_t addr)
 {
-    static char buf[32];
+    struct in_addr in_addr;
 
-    sprintf(buf,"%d.%d.%d.%d",
-            addr & 255,
-            ((addr >> 8) & 255),
-            ((addr >> 16) & 255),
-            (addr >> 24));
-    return buf;
+    in_addr.s_addr = addr;
+    return inet_ntoa(in_addr);
 }
+
+extern int ipv4NetmaskToPrefixLength(in_addr_t mask);
 
 typedef struct dhcp_info dhcp_info;
 
@@ -104,7 +102,7 @@ struct dhcp_info {
 
     uint32_t ipaddr;
     uint32_t gateway;
-    uint32_t netmask;
+    uint32_t prefixLength;
 
     uint32_t dns1;
     uint32_t dns2;
@@ -115,44 +113,24 @@ struct dhcp_info {
 
 dhcp_info last_good_info;
 
-void get_dhcp_info(uint32_t *ipaddr, uint32_t *gateway, uint32_t *mask,
+void get_dhcp_info(uint32_t *ipaddr, uint32_t *gateway, uint32_t *prefixLength,
                    uint32_t *dns1, uint32_t *dns2, uint32_t *server,
                    uint32_t *lease)
 {
     *ipaddr = last_good_info.ipaddr;
     *gateway = last_good_info.gateway;
-    *mask = last_good_info.netmask;
+    *prefixLength = last_good_info.prefixLength;
     *dns1 = last_good_info.dns1;
     *dns2 = last_good_info.dns2;
     *server = last_good_info.serveraddr;
     *lease = last_good_info.lease;
 }
 
-static int ifc_configure(const char *ifname, dhcp_info *info)
+static int dhcp_configure(const char *ifname, dhcp_info *info)
 {
-    char dns_prop_name[PROPERTY_KEY_MAX];
-
-    if (ifc_set_addr(ifname, info->ipaddr)) {
-        printerr("failed to set ipaddr %s: %s\n", ipaddr(info->ipaddr), strerror(errno));
-        return -1;
-    }
-    if (ifc_set_mask(ifname, info->netmask)) {
-        printerr("failed to set netmask %s: %s\n", ipaddr(info->netmask), strerror(errno));
-        return -1;
-    }
-    if (ifc_create_default_route(ifname, info->gateway)) {
-        printerr("failed to set default route %s: %s\n", ipaddr(info->gateway), strerror(errno));
-        return -1;
-    }
-
-    snprintf(dns_prop_name, sizeof(dns_prop_name), "net.%s.dns1", ifname);
-    property_set(dns_prop_name, info->dns1 ? ipaddr(info->dns1) : "");
-    snprintf(dns_prop_name, sizeof(dns_prop_name), "net.%s.dns2", ifname);
-    property_set(dns_prop_name, info->dns2 ? ipaddr(info->dns2) : "");
-
     last_good_info = *info;
-
-    return 0;
+    return ifc_configure(ifname, info->ipaddr, info->prefixLength, info->gateway,
+                         info->dns1, info->dns2);
 }
 
 static const char *dhcp_type_to_name(uint32_t type)
@@ -173,15 +151,14 @@ static const char *dhcp_type_to_name(uint32_t type)
 void dump_dhcp_info(dhcp_info *info)
 {
     char addr[20], gway[20], mask[20];
-    LOGD("--- dhcp %s (%d) ---",
+    ALOGD("--- dhcp %s (%d) ---",
             dhcp_type_to_name(info->type), info->type);
     strcpy(addr, ipaddr(info->ipaddr));
     strcpy(gway, ipaddr(info->gateway));
-    strcpy(mask, ipaddr(info->netmask));
-    LOGD("ip %s gw %s mask %s", addr, gway, mask);
-    if (info->dns1) LOGD("dns1: %s", ipaddr(info->dns1));
-    if (info->dns2) LOGD("dns2: %s", ipaddr(info->dns2));
-    LOGD("server %s, lease %d seconds",
+    ALOGD("ip %s gw %s prefixLength %d", addr, gway, info->prefixLength);
+    if (info->dns1) ALOGD("dns1: %s", ipaddr(info->dns1));
+    if (info->dns2) ALOGD("dns2: %s", ipaddr(info->dns2));
+    ALOGD("server %s, lease %d seconds",
             ipaddr(info->serveraddr), info->lease);
 }
 
@@ -220,7 +197,11 @@ int decode_dhcp_msg(dhcp_msg *msg, int len, dhcp_info *info)
         }
         switch(opt) {
         case OPT_SUBNET_MASK:
-            if (optlen >= 4) memcpy(&info->netmask, x, 4);
+            if (optlen >= 4) {
+                in_addr_t mask;
+                memcpy(&mask, x, 4);
+                info->prefixLength = ipv4NetmaskToPrefixLength(mask);
+            }
             break;
         case OPT_GATEWAY:
             if (optlen >= 4) memcpy(&info->gateway, x, 4);
@@ -273,9 +254,9 @@ void dump_dhcp_msg(dhcp_msg *msg, int len)
     const char *name;
     char buf[2048];
 
-    LOGD("===== DHCP message:");
+    ALOGD("===== DHCP message:");
     if (len < DHCP_MSG_FIXED_SIZE) {
-        LOGD("Invalid length %d, should be %d", len, DHCP_MSG_FIXED_SIZE);
+        ALOGD("Invalid length %d, should be %d", len, DHCP_MSG_FIXED_SIZE);
         return;
     }
 
@@ -287,18 +268,18 @@ void dump_dhcp_msg(dhcp_msg *msg, int len)
         name = "BOOTREPLY";
     else
         name = "????";
-    LOGD("op = %s (%d), htype = %d, hlen = %d, hops = %d",
+    ALOGD("op = %s (%d), htype = %d, hlen = %d, hops = %d",
            name, msg->op, msg->htype, msg->hlen, msg->hops);
-    LOGD("xid = 0x%08x secs = %d, flags = 0x%04x optlen = %d",
+    ALOGD("xid = 0x%08x secs = %d, flags = 0x%04x optlen = %d",
            ntohl(msg->xid), ntohs(msg->secs), ntohs(msg->flags), len);
-    LOGD("ciaddr = %s", ipaddr(msg->ciaddr));
-    LOGD("yiaddr = %s", ipaddr(msg->yiaddr));
-    LOGD("siaddr = %s", ipaddr(msg->siaddr));
-    LOGD("giaddr = %s", ipaddr(msg->giaddr));
+    ALOGD("ciaddr = %s", ipaddr(msg->ciaddr));
+    ALOGD("yiaddr = %s", ipaddr(msg->yiaddr));
+    ALOGD("siaddr = %s", ipaddr(msg->siaddr));
+    ALOGD("giaddr = %s", ipaddr(msg->giaddr));
 
     c = msg->hlen > 16 ? 16 : msg->hlen;
     hex2str(buf, msg->chaddr, c);
-    LOGD("chaddr = {%s}", buf);
+    ALOGD("chaddr = {%s}", buf);
 
     for (n = 0; n < 64; n++) {
         if ((msg->sname[n] < ' ') || (msg->sname[n] > 127)) {
@@ -316,8 +297,8 @@ void dump_dhcp_msg(dhcp_msg *msg, int len)
     }
     msg->file[127] = 0;
 
-    LOGD("sname = '%s'", msg->sname);
-    LOGD("file = '%s'", msg->file);
+    ALOGD("sname = '%s'", msg->sname);
+    ALOGD("file = '%s'", msg->file);
 
     if (len < 4) return;
     len -= 4;
@@ -350,7 +331,7 @@ void dump_dhcp_msg(dhcp_msg *msg, int len)
             name = dhcp_type_to_name(x[2]);
         else
             name = NULL;
-        LOGD("op %d len %d {%s} %s", x[0], optsz, buf, name == NULL ? "" : name);
+        ALOGD("op %d len %d {%s} %s", x[0], optsz, buf, name == NULL ? "" : name);
         len -= optsz;
         x = x + optsz + 2;
     }
@@ -370,28 +351,28 @@ static int send_message(int sock, int if_index, dhcp_msg  *msg, int size)
 static int is_valid_reply(dhcp_msg *msg, dhcp_msg *reply, int sz)
 {
     if (sz < DHCP_MSG_FIXED_SIZE) {
-        if (verbose) LOGD("netcfg: Wrong size %d != %d\n", sz, DHCP_MSG_FIXED_SIZE);
+        if (verbose) ALOGD("netcfg: Wrong size %d != %d\n", sz, DHCP_MSG_FIXED_SIZE);
         return 0;
     }
     if (reply->op != OP_BOOTREPLY) {
-        if (verbose) LOGD("netcfg: Wrong Op %d != %d\n", reply->op, OP_BOOTREPLY);
+        if (verbose) ALOGD("netcfg: Wrong Op %d != %d\n", reply->op, OP_BOOTREPLY);
         return 0;
     }
     if (reply->xid != msg->xid) {
-        if (verbose) LOGD("netcfg: Wrong Xid 0x%x != 0x%x\n", ntohl(reply->xid),
+        if (verbose) ALOGD("netcfg: Wrong Xid 0x%x != 0x%x\n", ntohl(reply->xid),
                           ntohl(msg->xid));
         return 0;
     }
     if (reply->htype != msg->htype) {
-        if (verbose) LOGD("netcfg: Wrong Htype %d != %d\n", reply->htype, msg->htype);
+        if (verbose) ALOGD("netcfg: Wrong Htype %d != %d\n", reply->htype, msg->htype);
         return 0;
     }
     if (reply->hlen != msg->hlen) {
-        if (verbose) LOGD("netcfg: Wrong Hlen %d != %d\n", reply->hlen, msg->hlen);
+        if (verbose) ALOGD("netcfg: Wrong Hlen %d != %d\n", reply->hlen, msg->hlen);
         return 0;
     }
     if (memcmp(msg->chaddr, reply->chaddr, msg->hlen)) {
-        if (verbose) LOGD("netcfg: Wrong chaddr %x != %x\n", *(reply->chaddr),*(msg->chaddr));
+        if (verbose) ALOGD("netcfg: Wrong chaddr %x != %x\n", *(reply->chaddr),*(msg->chaddr));
         return 0;
     }
     return 1;
@@ -449,7 +430,7 @@ int dhcp_init_ifc(const char *ifname)
                 printerr("timed out\n");
                 if ( info.type == DHCPOFFER ) {
                     printerr("no acknowledgement from DHCP server\nconfiguring %s with offered parameters\n", ifname);
-                    return ifc_configure(ifname, &info);
+                    return dhcp_configure(ifname, &info);
                 }
                 errno = ETIME;
                 close(s);
@@ -492,7 +473,7 @@ int dhcp_init_ifc(const char *ifname)
         r = receive_packet(s, &reply);
         if (r < 0) {
             if (errno != 0) {
-                LOGD("receive_packet failed (%d): %s", r, strerror(errno));
+                ALOGD("receive_packet failed (%d): %s", r, strerror(errno));
                 if (errno == ENETDOWN || errno == ENXIO) {
                     return -1;
                 }
@@ -530,7 +511,7 @@ int dhcp_init_ifc(const char *ifname)
             if (info.type == DHCPACK) {
                 printerr("configuring %s\n", ifname);
                 close(s);
-                return ifc_configure(ifname, &info);
+                return dhcp_configure(ifname, &info);
             } else if (info.type == DHCPNAK) {
                 printerr("configuration request denied\n");
                 close(s);

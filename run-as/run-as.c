@@ -29,6 +29,7 @@
 #include <time.h>
 #include <stdarg.h>
 
+#include <selinux/android.h>
 #include <private/android_filesystem_config.h>
 #include "package.h"
 
@@ -41,9 +42,9 @@
  *
  *  - This program should only run for the 'root' or 'shell' users
  *
- *  - Statically link against the C library, and avoid anything that
- *    is more complex than simple system calls until the uid/gid has
- *    been dropped to that of a normal user or you are sure to exit.
+ *  - Avoid anything that is more complex than simple system calls
+ *    until the uid/gid has been dropped to that of a normal user
+ *    or you are sure to exit.
  *
  *    This avoids depending on environment variables, system properties
  *    and other external factors that may affect the C library in
@@ -159,6 +160,11 @@ int main(int argc, char **argv)
     uid = gid = info.uid;
     if(setresgid(gid,gid,gid) || setresuid(uid,uid,uid)) {
         panic("Permission denied\n");
+        return 1;
+    }
+
+    if (selinux_android_setcontext(uid, 0, info.seinfo, pkgname) < 0) {
+        panic("Could not set SELinux security context:  %s\n", strerror(errno));
         return 1;
     }
 

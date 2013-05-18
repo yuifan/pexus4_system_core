@@ -35,6 +35,8 @@
  *	@(#)dd.h	8.3 (Berkeley) 4/2/94
  */
 
+#include <stdint.h>
+
 /* Input/output stream state. */
 typedef struct {
 	u_char		*db;		/* buffer address */
@@ -89,3 +91,4 @@ typedef struct {
 #define	C_UNBLOCK	0x80000
 #define	C_OSYNC		0x100000
 #define	C_SPARSE	0x200000
+#define	C_FDATASYNC	0x400000

@@ -1,9 +1,67 @@
 #include <stdio.h>
 #include <stdint.h>
 
-extern "C" void ggl_test_codegen(
-        uint32_t n, uint32_t p, uint32_t t0, uint32_t t1);
+#include "private/pixelflinger/ggl_context.h"
 
+#include "buffer.h"
+#include "scanline.h"
+
+#include "codeflinger/CodeCache.h"
+#include "codeflinger/GGLAssembler.h"
+#include "codeflinger/ARMAssembler.h"
+#include "codeflinger/MIPSAssembler.h"
+
+#if defined(__arm__) || defined(__mips__)
+#   define ANDROID_ARM_CODEGEN  1
+#else
+#   define ANDROID_ARM_CODEGEN  0
+#endif
+
+#if defined (__mips__)
+#define ASSEMBLY_SCRATCH_SIZE   4096
+#else
+#define ASSEMBLY_SCRATCH_SIZE   2048
+#endif
+
+using namespace android;
+
+class ScanlineAssembly : public Assembly {
+    AssemblyKey<needs_t> mKey;
+public:
+    ScanlineAssembly(needs_t needs, size_t size)
+        : Assembly(size), mKey(needs) { }
+    const AssemblyKey<needs_t>& key() const { return mKey; }
+};
+
+static void ggl_test_codegen(uint32_t n, uint32_t p, uint32_t t0, uint32_t t1)
+{
+#if ANDROID_ARM_CODEGEN
+    GGLContext* c;
+    gglInit(&c);
+    needs_t needs;
+    needs.n = n;
+    needs.p = p;
+    needs.t[0] = t0;
+    needs.t[1] = t1;
+    sp<ScanlineAssembly> a(new ScanlineAssembly(needs, ASSEMBLY_SCRATCH_SIZE));
+
+#if defined(__arm__)
+    GGLAssembler assembler( new ARMAssembler(a) );
+#endif
+
+#if defined(__mips__)
+    GGLAssembler assembler( new ArmToMipsAssembler(a) );
+#endif
+
+    int err = assembler.scanline(needs, (context_t*)c);
+    if (err != 0) {
+        printf("error %08x (%s)\n", err, strerror(-err));
+    }
+    gglUninit(c);
+#else
+    printf("This test runs only on ARM or MIPS\n");
+#endif
+}
 
 int main(int argc, char** argv)
 {

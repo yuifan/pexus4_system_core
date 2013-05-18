@@ -7,7 +7,15 @@ copy_from := \
 	etc/dbus.conf \
 	etc/hosts
 
-ifeq ($(TARGET_PRODUCT),generic)
+ifeq ($(TARGET_PRODUCT),full)
+copy_from += etc/vold.fstab
+endif
+
+ifeq ($(TARGET_PRODUCT),full_x86)
+copy_from += etc/vold.fstab
+endif
+
+ifeq ($(TARGET_PRODUCT),full_mips)
 copy_from += etc/vold.fstab
 endif
 
@@ -45,6 +53,8 @@ $(file) : $(LOCAL_PATH)/ueventd.rc | $(ACP)
 	$(transform-prebuilt-to-target)
 ALL_PREBUILT += $(file)
 $(INSTALLED_RAMDISK_TARGET): $(file)
+
+# init.usb.rc is handled by build/target/product/core.rc
 
 # Just like /system/etc/init.goldfish.sh, the /init.godlfish.rc is here
 # to allow -user builds to properly run the dex pre-optimization pass in

@@ -1,12 +1,19 @@
 # Copyright 2005 The Android Open Source Project
 
-ifeq ($(TARGET_ARCH),arm)
+ifneq ($(filter arm mips x86,$(TARGET_ARCH)),)
 
 LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 
-LOCAL_SRC_FILES:= debuggerd.c getevent.c unwind-arm.c pr-support.c utility.c
-LOCAL_CFLAGS := -Wall
+LOCAL_SRC_FILES:= \
+	backtrace.c \
+	debuggerd.c \
+	getevent.c \
+	tombstone.c \
+	utility.c \
+	$(TARGET_ARCH)/machine.c
+
+LOCAL_CFLAGS := -Wall -Wno-unused-parameter -std=gnu99
 LOCAL_MODULE := debuggerd
 
 ifeq ($(ARCH_ARM_HAVE_VFP),true)
@@ -16,16 +23,21 @@ ifeq ($(ARCH_ARM_HAVE_VFP_D32),true)
 LOCAL_CFLAGS += -DWITH_VFP_D32
 endif # ARCH_ARM_HAVE_VFP_D32
 
-LOCAL_STATIC_LIBRARIES := libcutils libc
+LOCAL_SHARED_LIBRARIES := \
+	libcutils \
+	libc \
+	libcorkscrew \
+	libselinux
 
 include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := crasher.c
-LOCAL_SRC_FILES += crashglue.S
+LOCAL_SRC_FILES += $(TARGET_ARCH)/crashglue.S
 LOCAL_MODULE := crasher
 LOCAL_MODULE_PATH := $(TARGET_OUT_OPTIONAL_EXECUTABLES)
-LOCAL_MODULE_TAGS := eng
+LOCAL_MODULE_TAGS := optional
+LOCAL_CFLAGS += -fstack-protector-all
 #LOCAL_FORCE_STATIC_EXECUTABLE := true
 LOCAL_SHARED_LIBRARIES := libcutils libc
 include $(BUILD_EXECUTABLE)
@@ -41,9 +53,9 @@ endif # ARCH_ARM_HAVE_VFP_D32
 LOCAL_SRC_FILES := vfp-crasher.c vfp.S
 LOCAL_MODULE := vfp-crasher
 LOCAL_MODULE_PATH := $(TARGET_OUT_OPTIONAL_EXECUTABLES)
-LOCAL_MODULE_TAGS := eng
+LOCAL_MODULE_TAGS := optional
 LOCAL_SHARED_LIBRARIES := libcutils libc
 include $(BUILD_EXECUTABLE)
 endif # ARCH_ARM_HAVE_VFP == true
 
-endif # TARGET_ARCH == arm
+endif # arm or x86 in TARGET_ARCH

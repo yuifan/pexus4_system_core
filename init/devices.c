@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -28,19 +29,29 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <linux/netlink.h>
+
+#include <selinux/selinux.h>
+#include <selinux/label.h>
+#include <selinux/android.h>
+
 #include <private/android_filesystem_config.h>
 #include <sys/time.h>
 #include <asm/page.h>
 #include <sys/wait.h>
 
+#include <cutils/list.h>
+#include <cutils/uevent.h>
+
 #include "devices.h"
 #include "util.h"
 #include "log.h"
-#include "list.h"
 
 #define SYSFS_PREFIX    "/sys"
 #define FIRMWARE_DIR1   "/etc/firmware"
 #define FIRMWARE_DIR2   "/vendor/firmware"
+#define FIRMWARE_DIR3   "/firmware/image"
+
+extern struct selabel_handle *sehandle;
 
 static int device_fd = -1;
 
@@ -50,37 +61,11 @@ struct uevent {
     const char *subsystem;
     const char *firmware;
     const char *partition_name;
+    const char *device_name;
     int partition_num;
     int major;
     int minor;
 };
-
-static int open_uevent_socket(void)
-{
-    struct sockaddr_nl addr;
-    int sz = 64*1024; // XXX larger? udev uses 16MB!
-    int on = 1;
-    int s;
-
-    memset(&addr, 0, sizeof(addr));
-    addr.nl_family = AF_NETLINK;
-    addr.nl_pid = getpid();
-    addr.nl_groups = 0xffffffff;
-
-    s = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
-    if(s < 0)
-        return -1;
-
-    setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &sz, sizeof(sz));
-    setsockopt(s, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on));
-
-    if(bind(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        close(s);
-        return -1;
-    }
-
-    return s;
-}
 
 struct perms_ {
     char *name;
@@ -96,8 +81,16 @@ struct perm_node {
     struct listnode plist;
 };
 
+struct platform_node {
+    char *name;
+    char *path;
+    int path_len;
+    struct listnode list;
+};
+
 static list_declare(sys_perms);
 static list_declare(dev_perms);
+static list_declare(platform_names);
 
 int add_dev_perms(const char *name, const char *attr,
                   mode_t perm, unsigned int uid, unsigned int gid,
@@ -134,6 +127,7 @@ void fixup_sys_perms(const char *upath)
     char buf[512];
     struct listnode *node;
     struct perms_ *dp;
+    char *secontext;
 
         /* upaths omit the "/sys" that paths in this list
          * contain, so we add 4 when comparing...
@@ -155,6 +149,14 @@ void fixup_sys_perms(const char *upath)
         INFO("fixup %s %d %d 0%o\n", buf, dp->uid, dp->gid, dp->perm);
         chown(buf, dp->uid, dp->gid);
         chmod(buf, dp->perm);
+        if (sehandle) {
+            secontext = NULL;
+            selabel_lookup(sehandle, &secontext, buf, 0);
+            if (secontext) {
+                setfilecon(buf, secontext);
+                freecon(secontext);
+           }
+        }
     }
 }
 
@@ -197,8 +199,15 @@ static void make_device(const char *path,
     unsigned gid;
     mode_t mode;
     dev_t dev;
+    char *secontext = NULL;
 
     mode = get_device_perm(path, &uid, &gid) | (block ? S_IFBLK : S_IFCHR);
+
+    if (sehandle) {
+        selabel_lookup(sehandle, &secontext, path, mode);
+        setfscreatecon(secontext);
+    }
+
     dev = makedev(major, minor);
     /* Temporarily change egid to avoid race condition setting the gid of the
      * device node. Unforunately changing the euid would prevent creation of
@@ -209,6 +218,81 @@ static void make_device(const char *path,
     mknod(path, mode, dev);
     chown(path, uid, -1);
     setegid(AID_ROOT);
+
+    if (secontext) {
+        freecon(secontext);
+        setfscreatecon(NULL);
+    }
+}
+
+static void add_platform_device(const char *path)
+{
+    int path_len = strlen(path);
+    struct listnode *node;
+    struct platform_node *bus;
+    const char *name = path;
+
+    if (!strncmp(path, "/devices/", 9)) {
+        name += 9;
+        if (!strncmp(name, "platform/", 9))
+            name += 9;
+    }
+
+    list_for_each_reverse(node, &platform_names) {
+        bus = node_to_item(node, struct platform_node, list);
+        if ((bus->path_len < path_len) &&
+                (path[bus->path_len] == '/') &&
+                !strncmp(path, bus->path, bus->path_len))
+            /* subdevice of an existing platform, ignore it */
+            return;
+    }
+
+    INFO("adding platform device %s (%s)\n", name, path);
+
+    bus = calloc(1, sizeof(struct platform_node));
+    bus->path = strdup(path);
+    bus->path_len = path_len;
+    bus->name = bus->path + (name - path);
+    list_add_tail(&platform_names, &bus->list);
+}
+
+/*
+ * given a path that may start with a platform device, find the length of the
+ * platform device prefix.  If it doesn't start with a platform device, return
+ * 0.
+ */
+static struct platform_node *find_platform_device(const char *path)
+{
+    int path_len = strlen(path);
+    struct listnode *node;
+    struct platform_node *bus;
+
+    list_for_each_reverse(node, &platform_names) {
+        bus = node_to_item(node, struct platform_node, list);
+        if ((bus->path_len < path_len) &&
+                (path[bus->path_len] == '/') &&
+                !strncmp(path, bus->path, bus->path_len))
+            return bus;
+    }
+
+    return NULL;
+}
+
+static void remove_platform_device(const char *path)
+{
+    struct listnode *node;
+    struct platform_node *bus;
+
+    list_for_each_reverse(node, &platform_names) {
+        bus = node_to_item(node, struct platform_node, list);
+        if (!strcmp(path, bus->path)) {
+            INFO("removing platform device %s\n", bus->name);
+            free(bus->path);
+            list_remove(node);
+            free(bus);
+            return;
+        }
+    }
 }
 
 #if LOG_UEVENTS
@@ -239,6 +323,7 @@ static void parse_event(const char *msg, struct uevent *uevent)
     uevent->minor = -1;
     uevent->partition_name = NULL;
     uevent->partition_num = -1;
+    uevent->device_name = NULL;
 
         /* currently ignoring SEQNUM */
     while(*msg) {
@@ -266,9 +351,12 @@ static void parse_event(const char *msg, struct uevent *uevent)
         } else if(!strncmp(msg, "PARTNAME=", 9)) {
             msg += 9;
             uevent->partition_name = msg;
+        } else if(!strncmp(msg, "DEVNAME=", 8)) {
+            msg += 8;
+            uevent->device_name = msg;
         }
 
-            /* advance to after the next \0 */
+        /* advance to after the next \0 */
         while(*msg++)
             ;
     }
@@ -278,10 +366,63 @@ static void parse_event(const char *msg, struct uevent *uevent)
                     uevent->firmware, uevent->major, uevent->minor);
 }
 
+static char **get_character_device_symlinks(struct uevent *uevent)
+{
+    const char *parent;
+    char *slash;
+    char **links;
+    int link_num = 0;
+    int width;
+    struct platform_node *pdev;
+
+    pdev = find_platform_device(uevent->path);
+    if (!pdev)
+        return NULL;
+
+    links = malloc(sizeof(char *) * 2);
+    if (!links)
+        return NULL;
+    memset(links, 0, sizeof(char *) * 2);
+
+    /* skip "/devices/platform/<driver>" */
+    parent = strchr(uevent->path + pdev->path_len, '/');
+    if (!*parent)
+        goto err;
+
+    if (!strncmp(parent, "/usb", 4)) {
+        /* skip root hub name and device. use device interface */
+        while (*++parent && *parent != '/');
+        if (*parent)
+            while (*++parent && *parent != '/');
+        if (!*parent)
+            goto err;
+        slash = strchr(++parent, '/');
+        if (!slash)
+            goto err;
+        width = slash - parent;
+        if (width <= 0)
+            goto err;
+
+        if (asprintf(&links[link_num], "/dev/usb/%s%.*s", uevent->subsystem, width, parent) > 0)
+            link_num++;
+        else
+            links[link_num] = NULL;
+        mkdir("/dev/usb", 0755);
+    }
+    else {
+        goto err;
+    }
+
+    return links;
+err:
+    free(links);
+    return NULL;
+}
+
 static char **parse_platform_block_device(struct uevent *uevent)
 {
-    const char *driver;
-    const char *path;
+    const char *device;
+    struct platform_node *pdev;
     char *slash;
     int width;
     char buf[256];
@@ -293,23 +434,19 @@ static char **parse_platform_block_device(struct uevent *uevent)
     unsigned int size;
     struct stat info;
 
+    pdev = find_platform_device(uevent->path);
+    if (!pdev)
+        return NULL;
+    device = pdev->name;
+
     char **links = malloc(sizeof(char *) * 4);
     if (!links)
         return NULL;
     memset(links, 0, sizeof(char *) * 4);
 
-    /* Drop "/devices/platform/" */
-    path = uevent->path;
-    driver = path + 18;
-    slash = strchr(driver, '/');
-    if (!slash)
-        goto err;
-    width = slash - driver;
-    if (width <= 0)
-        goto err;
+    INFO("found platform device %s\n", device);
 
-    snprintf(link_path, sizeof(link_path), "/dev/block/platform/%.*s",
-             width, driver);
+    snprintf(link_path, sizeof(link_path), "/dev/block/platform/%s", device);
 
     if (uevent->partition_name) {
         p = strdup(uevent->partition_name);
@@ -328,116 +465,29 @@ static char **parse_platform_block_device(struct uevent *uevent)
             links[link_num] = NULL;
     }
 
-    slash = strrchr(path, '/');
+    slash = strrchr(uevent->path, '/');
     if (asprintf(&links[link_num], "%s/%s", link_path, slash + 1) > 0)
         link_num++;
     else
         links[link_num] = NULL;
 
     return links;
-
-err:
-    free(links);
-    return NULL;
 }
 
-static void handle_device_event(struct uevent *uevent)
+static void handle_device(const char *action, const char *devpath,
+        const char *path, int block, int major, int minor, char **links)
 {
-    char devpath[96];
-    int devpath_ready = 0;
-    char *base, *name;
-    char **links = NULL;
-    int block;
     int i;
 
-    if (!strcmp(uevent->action,"add"))
-        fixup_sys_perms(uevent->path);
-
-        /* if it's not a /dev device, nothing else to do */
-    if((uevent->major < 0) || (uevent->minor < 0))
-        return;
-
-        /* do we have a name? */
-    name = strrchr(uevent->path, '/');
-    if(!name)
-        return;
-    name++;
-
-        /* too-long names would overrun our buffer */
-    if(strlen(name) > 64)
-        return;
-
-        /* are we block or char? where should we live? */
-    if(!strncmp(uevent->subsystem, "block", 5)) {
-        block = 1;
-        base = "/dev/block/";
-        mkdir(base, 0755);
-        if (!strncmp(uevent->path, "/devices/platform/", 18))
-            links = parse_platform_block_device(uevent);
-    } else {
-        block = 0;
-            /* this should probably be configurable somehow */
-        if (!strncmp(uevent->subsystem, "usb", 3)) {
-            if (!strcmp(uevent->subsystem, "usb")) {
-                /* This imitates the file system that would be created
-                 * if we were using devfs instead.
-                 * Minors are broken up into groups of 128, starting at "001"
-                 */
-                int bus_id = uevent->minor / 128 + 1;
-                int device_id = uevent->minor % 128 + 1;
-                /* build directories */
-                mkdir("/dev/bus", 0755);
-                mkdir("/dev/bus/usb", 0755);
-                snprintf(devpath, sizeof(devpath), "/dev/bus/usb/%03d", bus_id);
-                mkdir(devpath, 0755);
-                snprintf(devpath, sizeof(devpath), "/dev/bus/usb/%03d/%03d", bus_id, device_id);
-                devpath_ready = 1;
-            } else {
-                /* ignore other USB events */
-                return;
-            }
-        } else if (!strncmp(uevent->subsystem, "graphics", 8)) {
-            base = "/dev/graphics/";
-            mkdir(base, 0755);
-        } else if (!strncmp(uevent->subsystem, "oncrpc", 6)) {
-            base = "/dev/oncrpc/";
-            mkdir(base, 0755);
-        } else if (!strncmp(uevent->subsystem, "adsp", 4)) {
-            base = "/dev/adsp/";
-            mkdir(base, 0755);
-        } else if (!strncmp(uevent->subsystem, "msm_camera", 10)) {
-            base = "/dev/msm_camera/";
-            mkdir(base, 0755);
-        } else if(!strncmp(uevent->subsystem, "input", 5)) {
-            base = "/dev/input/";
-            mkdir(base, 0755);
-        } else if(!strncmp(uevent->subsystem, "mtd", 3)) {
-            base = "/dev/mtd/";
-            mkdir(base, 0755);
-        } else if(!strncmp(uevent->subsystem, "sound", 5)) {
-            base = "/dev/snd/";
-            mkdir(base, 0755);
-        } else if(!strncmp(uevent->subsystem, "misc", 4) &&
-                    !strncmp(name, "log_", 4)) {
-            base = "/dev/log/";
-            mkdir(base, 0755);
-            name += 4;
-        } else
-            base = "/dev/";
-    }
-
-    if (!devpath_ready)
-        snprintf(devpath, sizeof(devpath), "%s%s", base, name);
-
-    if(!strcmp(uevent->action, "add")) {
-        make_device(devpath, uevent->path, block, uevent->major, uevent->minor);
+    if(!strcmp(action, "add")) {
+        make_device(devpath, path, block, major, minor);
         if (links) {
             for (i = 0; links[i]; i++)
                 make_link(devpath, links[i]);
         }
     }
 
-    if(!strcmp(uevent->action, "remove")) {
+    if(!strcmp(action, "remove")) {
         if (links) {
             for (i = 0; links[i]; i++)
                 remove_link(devpath, links[i]);
@@ -449,6 +499,162 @@ static void handle_device_event(struct uevent *uevent)
         for (i = 0; links[i]; i++)
             free(links[i]);
         free(links);
+    }
+}
+
+static void handle_platform_device_event(struct uevent *uevent)
+{
+    const char *path = uevent->path;
+
+    if (!strcmp(uevent->action, "add"))
+        add_platform_device(path);
+    else if (!strcmp(uevent->action, "remove"))
+        remove_platform_device(path);
+}
+
+static const char *parse_device_name(struct uevent *uevent, unsigned int len)
+{
+    const char *name;
+
+    /* if it's not a /dev device, nothing else to do */
+    if((uevent->major < 0) || (uevent->minor < 0))
+        return NULL;
+
+    /* do we have a name? */
+    name = strrchr(uevent->path, '/');
+    if(!name)
+        return NULL;
+    name++;
+
+    /* too-long names would overrun our buffer */
+    if(strlen(name) > len)
+        return NULL;
+
+    return name;
+}
+
+static void handle_block_device_event(struct uevent *uevent)
+{
+    const char *base = "/dev/block/";
+    const char *name;
+    char devpath[96];
+    char **links = NULL;
+
+    name = parse_device_name(uevent, 64);
+    if (!name)
+        return;
+
+    snprintf(devpath, sizeof(devpath), "%s%s", base, name);
+    make_dir(base, 0755);
+
+    if (!strncmp(uevent->path, "/devices/", 9))
+        links = parse_platform_block_device(uevent);
+
+    handle_device(uevent->action, devpath, uevent->path, 1,
+            uevent->major, uevent->minor, links);
+}
+
+static void handle_generic_device_event(struct uevent *uevent)
+{
+    char *base;
+    const char *name;
+    char devpath[96] = {0};
+    char **links = NULL;
+
+    name = parse_device_name(uevent, 64);
+    if (!name)
+        return;
+
+    if (!strncmp(uevent->subsystem, "usb", 3)) {
+         if (!strcmp(uevent->subsystem, "usb")) {
+            if (uevent->device_name) {
+                /*
+                 * create device node provided by kernel if present
+                 * see drivers/base/core.c
+                 */
+                char *p = devpath;
+                snprintf(devpath, sizeof(devpath), "/dev/%s", uevent->device_name);
+                /* skip leading /dev/ */
+                p += 5;
+                /* build directories */
+                while (*p) {
+                    if (*p == '/') {
+                        *p = 0;
+                        make_dir(devpath, 0755);
+                        *p = '/';
+                    }
+                    p++;
+                }
+             }
+             else {
+                 /* This imitates the file system that would be created
+                  * if we were using devfs instead.
+                  * Minors are broken up into groups of 128, starting at "001"
+                  */
+                 int bus_id = uevent->minor / 128 + 1;
+                 int device_id = uevent->minor % 128 + 1;
+                 /* build directories */
+                 make_dir("/dev/bus", 0755);
+                 make_dir("/dev/bus/usb", 0755);
+                 snprintf(devpath, sizeof(devpath), "/dev/bus/usb/%03d", bus_id);
+                 make_dir(devpath, 0755);
+                 snprintf(devpath, sizeof(devpath), "/dev/bus/usb/%03d/%03d", bus_id, device_id);
+             }
+         } else {
+             /* ignore other USB events */
+             return;
+         }
+     } else if (!strncmp(uevent->subsystem, "graphics", 8)) {
+         base = "/dev/graphics/";
+         make_dir(base, 0755);
+     } else if (!strncmp(uevent->subsystem, "drm", 3)) {
+         base = "/dev/dri/";
+         make_dir(base, 0755);
+     } else if (!strncmp(uevent->subsystem, "oncrpc", 6)) {
+         base = "/dev/oncrpc/";
+         make_dir(base, 0755);
+     } else if (!strncmp(uevent->subsystem, "adsp", 4)) {
+         base = "/dev/adsp/";
+         make_dir(base, 0755);
+     } else if (!strncmp(uevent->subsystem, "msm_camera", 10)) {
+         base = "/dev/msm_camera/";
+         make_dir(base, 0755);
+     } else if(!strncmp(uevent->subsystem, "input", 5)) {
+         base = "/dev/input/";
+         make_dir(base, 0755);
+     } else if(!strncmp(uevent->subsystem, "mtd", 3)) {
+         base = "/dev/mtd/";
+         make_dir(base, 0755);
+     } else if(!strncmp(uevent->subsystem, "sound", 5)) {
+         base = "/dev/snd/";
+         make_dir(base, 0755);
+     } else if(!strncmp(uevent->subsystem, "misc", 4) &&
+                 !strncmp(name, "log_", 4)) {
+         base = "/dev/log/";
+         make_dir(base, 0755);
+         name += 4;
+     } else
+         base = "/dev/";
+     links = get_character_device_symlinks(uevent);
+
+     if (!devpath[0])
+         snprintf(devpath, sizeof(devpath), "%s%s", base, name);
+
+     handle_device(uevent->action, devpath, uevent->path, 0,
+             uevent->major, uevent->minor, links);
+}
+
+static void handle_device_event(struct uevent *uevent)
+{
+    if (!strcmp(uevent->action,"add") || !strcmp(uevent->action, "change"))
+        fixup_sys_perms(uevent->path);
+
+    if (!strncmp(uevent->subsystem, "block", 5)) {
+        handle_block_device_event(uevent);
+    } else if (!strncmp(uevent->subsystem, "platform", 8)) {
+        handle_platform_device_event(uevent);
+    } else {
+        handle_generic_device_event(uevent);
     }
 }
 
@@ -498,13 +704,19 @@ out:
     return ret;
 }
 
+static int is_booting(void)
+{
+    return access("/dev/.booting", F_OK) == 0;
+}
+
 static void process_firmware_event(struct uevent *uevent)
 {
-    char *root, *loading, *data, *file1 = NULL, *file2 = NULL;
+    char *root, *loading, *data, *file1 = NULL, *file2 = NULL, *file3 = NULL;
     int l, loading_fd, data_fd, fw_fd;
+    int booting = is_booting();
 
-    log_event_print("firmware event { '%s', '%s' }\n",
-                    uevent->path, uevent->firmware);
+    INFO("firmware: loading '%s' for '%s'\n",
+         uevent->firmware, uevent->path);
 
     l = asprintf(&root, SYSFS_PREFIX"%s/", uevent->path);
     if (l == -1)
@@ -526,6 +738,10 @@ static void process_firmware_event(struct uevent *uevent)
     if (l == -1)
         goto data_free_out;
 
+    l = asprintf(&file3, FIRMWARE_DIR3"/%s", uevent->firmware);
+    if (l == -1)
+        goto data_free_out;
+
     loading_fd = open(loading, O_WRONLY);
     if(loading_fd < 0)
         goto file_free_out;
@@ -534,17 +750,32 @@ static void process_firmware_event(struct uevent *uevent)
     if(data_fd < 0)
         goto loading_close_out;
 
+try_loading_again:
     fw_fd = open(file1, O_RDONLY);
     if(fw_fd < 0) {
         fw_fd = open(file2, O_RDONLY);
-        if(fw_fd < 0)
-            goto data_close_out;
+        if (fw_fd < 0) {
+            fw_fd = open(file3, O_RDONLY);
+            if (fw_fd < 0) {
+                if (booting) {
+                        /* If we're not fully booted, we may be missing
+                         * filesystems needed for firmware, wait and retry.
+                         */
+                    usleep(100000);
+                    booting = is_booting();
+                    goto try_loading_again;
+                }
+                INFO("firmware: could not open '%s' %d\n", uevent->firmware, errno);
+                write(loading_fd, "-1", 2);
+                goto data_close_out;
+            }
+        }
     }
 
     if(!load_firmware(fw_fd, loading_fd, data_fd))
-        log_event_print("firmware copy success { '%s', '%s' }\n", root, uevent->firmware);
+        INFO("firmware: copy success { '%s', '%s' }\n", root, uevent->firmware);
     else
-        log_event_print("firmware copy failure { '%s', '%s' }\n", root, uevent->firmware);
+        INFO("firmware: copy failure { '%s', '%s' }\n", root, uevent->firmware);
 
     close(fw_fd);
 data_close_out:
@@ -565,7 +796,6 @@ root_free_out:
 static void handle_firmware_event(struct uevent *uevent)
 {
     pid_t pid;
-    int status;
     int ret;
 
     if(strcmp(uevent->subsystem, "firmware"))
@@ -579,45 +809,15 @@ static void handle_firmware_event(struct uevent *uevent)
     if (!pid) {
         process_firmware_event(uevent);
         exit(EXIT_SUCCESS);
-    } else {
-        do {
-            ret = waitpid(pid, &status, 0);
-        } while (ret == -1 && errno == EINTR);
     }
 }
 
 #define UEVENT_MSG_LEN  1024
 void handle_device_fd()
 {
-    for(;;) {
-        char msg[UEVENT_MSG_LEN+2];
-        char cred_msg[CMSG_SPACE(sizeof(struct ucred))];
-        struct iovec iov = {msg, sizeof(msg)};
-        struct sockaddr_nl snl;
-        struct msghdr hdr = {&snl, sizeof(snl), &iov, 1, cred_msg, sizeof(cred_msg), 0};
-
-        ssize_t n = recvmsg(device_fd, &hdr, 0);
-        if (n <= 0) {
-            break;
-        }
-
-        if ((snl.nl_groups != 1) || (snl.nl_pid != 0)) {
-            /* ignoring non-kernel netlink multicast message */
-            continue;
-        }
-
-        struct cmsghdr * cmsg = CMSG_FIRSTHDR(&hdr);
-        if (cmsg == NULL || cmsg->cmsg_type != SCM_CREDENTIALS) {
-            /* no sender credentials received, ignore message */
-            continue;
-        }
-
-        struct ucred * cred = (struct ucred *)CMSG_DATA(cmsg);
-        if (cred->uid != 0) {
-            /* message from non-root user, ignore */
-            continue;
-        }
-
+    char msg[UEVENT_MSG_LEN+2];
+    int n;
+    while ((n = uevent_kernel_multicast_recv(device_fd, msg, UEVENT_MSG_LEN)) > 0) {
         if(n >= UEVENT_MSG_LEN)   /* overflow -- discard */
             continue;
 
@@ -690,7 +890,13 @@ void device_init(void)
     struct stat info;
     int fd;
 
-    device_fd = open_uevent_socket();
+    sehandle = NULL;
+    if (is_selinux_enabled() > 0) {
+        sehandle = selinux_android_file_context_handle();
+    }
+
+    /* is 256K enough? udev uses 16MB! */
+    device_fd = uevent_open_socket(256*1024, true);
     if(device_fd < 0)
         return;
 

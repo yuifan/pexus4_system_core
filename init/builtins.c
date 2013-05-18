@@ -29,7 +29,14 @@
 #include <stdlib.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <linux/loop.h>
+#include <cutils/partition_utils.h>
+#include <sys/system_properties.h>
+#include <fs_mgr.h>
+
+#include <selinux/selinux.h>
+#include <selinux/label.h>
 
 #include "init.h"
 #include "keywords.h"
@@ -66,6 +73,63 @@ static int write_file(const char *path, const char *value)
     } else {
         return 0;
     }
+}
+
+static int _open(const char *path)
+{
+    int fd;
+
+    fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
+        fd = open(path, O_WRONLY | O_NOFOLLOW);
+
+    return fd;
+}
+
+static int _chown(const char *path, unsigned int uid, unsigned int gid)
+{
+    int fd;
+    int ret;
+
+    fd = _open(path);
+    if (fd < 0) {
+        return -1;
+    }
+
+    ret = fchown(fd, uid, gid);
+    if (ret < 0) {
+        int errno_copy = errno;
+        close(fd);
+        errno = errno_copy;
+        return -1;
+    }
+
+    close(fd);
+
+    return 0;
+}
+
+static int _chmod(const char *path, mode_t mode)
+{
+    int fd;
+    int ret;
+
+    fd = _open(path);
+    if (fd < 0) {
+        return -1;
+    }
+
+    ret = fchmod(fd, mode);
+    if (ret < 0) {
+        int errno_copy = errno;
+        close(fd);
+        errno = errno_copy;
+        return -1;
+    }
+
+    close(fd);
+
+    return 0;
 }
 
 static int insmod(const char *filename, char *options)
@@ -162,6 +226,12 @@ int do_class_stop(int nargs, char **args)
     return 0;
 }
 
+int do_class_reset(int nargs, char **args)
+{
+    service_for_each_class(args[1], service_reset);
+    return 0;
+}
+
 int do_domainname(int nargs, char **args)
 {
     return write_file("/proc/sys/kernel/domainname", args[1]);
@@ -219,14 +289,10 @@ int do_insmod(int nargs, char **args)
     return do_insmod_inner(nargs, args, size);
 }
 
-int do_import(int nargs, char **args)
-{
-    return init_parse_config_file(args[1]);
-}
-
 int do_mkdir(int nargs, char **args)
 {
     mode_t mode = 0755;
+    int ret;
 
     /* mkdir <path> [mode] [owner] [group] */
 
@@ -234,7 +300,12 @@ int do_mkdir(int nargs, char **args)
         mode = strtoul(args[2], 0, 8);
     }
 
-    if (mkdir(args[1], mode)) {
+    ret = make_dir(args[1], mode);
+    /* chmod in case the directory already exists */
+    if (ret == -1 && errno == EEXIST) {
+        ret = _chmod(args[1], mode);
+    }
+    if (ret == -1) {
         return -errno;
     }
 
@@ -246,8 +317,16 @@ int do_mkdir(int nargs, char **args)
             gid = decode_uid(args[4]);
         }
 
-        if (chown(args[1], uid, gid)) {
+        if (_chown(args[1], uid, gid) < 0) {
             return -errno;
+        }
+
+        /* chown may have cleared S_ISUID and S_ISGID, chmod again */
+        if (mode & (S_ISUID | S_ISGID)) {
+            ret = _chmod(args[1], mode);
+            if (ret == -1) {
+                return -errno;
+            }
         }
     }
 
@@ -258,17 +337,25 @@ static struct {
     const char *name;
     unsigned flag;
 } mount_flags[] = {
-    { "move",       MS_MOVE },
     { "noatime",    MS_NOATIME },
+    { "noexec",     MS_NOEXEC },
     { "nosuid",     MS_NOSUID },
     { "nodev",      MS_NODEV },
     { "nodiratime", MS_NODIRATIME },
     { "ro",         MS_RDONLY },
     { "rw",         0 },
     { "remount",    MS_REMOUNT },
+    { "bind",       MS_BIND },
+    { "rec",        MS_REC },
+    { "unbindable", MS_UNBINDABLE },
+    { "private",    MS_PRIVATE },
+    { "slave",      MS_SLAVE },
+    { "shared",     MS_SHARED },
     { "defaults",   0 },
     { 0,            0 },
 };
+
+#define DATA_MNT_POINT "/data"
 
 /* mount <type> <device> <path> <flags ...> <options> */
 int do_mount(int nargs, char **args)
@@ -315,7 +402,7 @@ int do_mount(int nargs, char **args)
             return -1;
         }
 
-        return 0;
+        goto exit_success;
     } else if (!strncmp(source, "loop@", 5)) {
         int mode, loop, fd;
         struct loop_info info;
@@ -346,7 +433,7 @@ int do_mount(int nargs, char **args)
                     }
 
                     close(loop);
-                    return 0;
+                    goto exit_success;
                 }
             }
 
@@ -363,8 +450,84 @@ int do_mount(int nargs, char **args)
             return -1;
         }
 
-        return 0;
     }
+
+exit_success:
+    return 0;
+
+}
+
+int do_mount_all(int nargs, char **args)
+{
+    pid_t pid;
+    int ret = -1;
+    int child_ret = -1;
+    int status;
+    const char *prop;
+
+    if (nargs != 2) {
+        return -1;
+    }
+
+    /*
+     * Call fs_mgr_mount_all() to mount all filesystems.  We fork(2) and
+     * do the call in the child to provide protection to the main init
+     * process if anything goes wrong (crash or memory leak), and wait for
+     * the child to finish in the parent.
+     */
+    pid = fork();
+    if (pid > 0) {
+        /* Parent.  Wait for the child to return */
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            ret = WEXITSTATUS(status);
+        } else {
+            ret = -1;
+        }
+    } else if (pid == 0) {
+        /* child, call fs_mgr_mount_all() */
+        klog_set_level(6);  /* So we can see what fs_mgr_mount_all() does */
+        child_ret = fs_mgr_mount_all(args[1]);
+        if (child_ret == -1) {
+            ERROR("fs_mgr_mount_all returned an error\n");
+        }
+        exit(child_ret);
+    } else {
+        /* fork failed, return an error */
+        return -1;
+    }
+
+    /* ret is 1 if the device is encrypted, 0 if not, and -1 on error */
+    if (ret == 1) {
+        property_set("ro.crypto.state", "encrypted");
+        property_set("vold.decrypt", "1");
+    } else if (ret == 0) {
+        property_set("ro.crypto.state", "unencrypted");
+        /* If fs_mgr determined this is an unencrypted device, then trigger
+         * that action.
+         */
+        action_for_each_trigger("nonencrypted", action_add_queue_tail);
+    }
+
+    return ret;
+}
+
+int do_setcon(int nargs, char **args) {
+    if (is_selinux_enabled() <= 0)
+        return 0;
+    if (setcon(args[1]) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+int do_setenforce(int nargs, char **args) {
+    if (is_selinux_enabled() <= 0)
+        return 0;
+    if (security_setenforce(atoi(args[1])) < 0) {
+        return -errno;
+    }
+    return 0;
 }
 
 int do_setkey(int nargs, char **args)
@@ -378,7 +541,17 @@ int do_setkey(int nargs, char **args)
 
 int do_setprop(int nargs, char **args)
 {
-    property_set(args[1], args[2]);
+    const char *name = args[1];
+    const char *value = args[2];
+    char prop_val[PROP_VALUE_MAX];
+    int ret;
+
+    ret = expand_props(prop_val, value, sizeof(prop_val));
+    if (ret) {
+        ERROR("cannot expand '%s' while assigning to '%s'\n", value, name);
+        return -EINVAL;
+    }
+    property_set(name, prop_val);
     return 0;
 }
 
@@ -434,6 +607,16 @@ int do_symlink(int nargs, char **args)
     return symlink(args[1], args[2]);
 }
 
+int do_rm(int nargs, char **args)
+{
+    return unlink(args[1]);
+}
+
+int do_rmdir(int nargs, char **args)
+{
+    return rmdir(args[1]);
+}
+
 int do_sysclktz(int nargs, char **args)
 {
     struct timezone tz;
@@ -450,7 +633,17 @@ int do_sysclktz(int nargs, char **args)
 
 int do_write(int nargs, char **args)
 {
-    return write_file(args[1], args[2]);
+    const char *path = args[1];
+    const char *value = args[2];
+    char prop_val[PROP_VALUE_MAX];
+    int ret;
+
+    ret = expand_props(prop_val, value, sizeof(prop_val));
+    if (ret) {
+        ERROR("cannot expand '%s' while writing to '%s'\n", value, path);
+        return -EINVAL;
+    }
+    return write_file(path, prop_val);
 }
 
 int do_copy(int nargs, char **args)
@@ -518,10 +711,10 @@ out:
 int do_chown(int nargs, char **args) {
     /* GID is optional. */
     if (nargs == 3) {
-        if (chown(args[2], decode_uid(args[1]), -1) < 0)
+        if (_chown(args[2], decode_uid(args[1]), -1) < 0)
             return -errno;
     } else if (nargs == 4) {
-        if (chown(args[3], decode_uid(args[1]), decode_uid(args[2])))
+        if (_chown(args[3], decode_uid(args[1]), decode_uid(args[2])) < 0)
             return -errno;
     } else {
         return -1;
@@ -544,15 +737,61 @@ static mode_t get_mode(const char *s) {
 
 int do_chmod(int nargs, char **args) {
     mode_t mode = get_mode(args[1]);
-    if (chmod(args[2], mode) < 0) {
+    if (_chmod(args[2], mode) < 0) {
         return -errno;
     }
     return 0;
 }
 
+int do_restorecon(int nargs, char **args) {
+    int i;
+
+    for (i = 1; i < nargs; i++) {
+        if (restorecon(args[i]) < 0)
+            return -errno;
+    }
+    return 0;
+}
+
+int do_setsebool(int nargs, char **args) {
+    const char *name = args[1];
+    const char *value = args[2];
+    SELboolean b;
+    int ret;
+
+    if (is_selinux_enabled() <= 0)
+        return 0;
+
+    b.name = name;
+    if (!strcmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "on"))
+        b.value = 1;
+    else if (!strcmp(value, "0") || !strcasecmp(value, "false") || !strcasecmp(value, "off"))
+        b.value = 0;
+    else {
+        ERROR("setsebool: invalid value %s\n", value);
+        return -EINVAL;
+    }
+
+    if (security_set_boolean_list(1, &b, 0) < 0) {
+        ret = -errno;
+        ERROR("setsebool: could not set %s to %s\n", name, value);
+        return ret;
+    }
+
+    return 0;
+}
+
 int do_loglevel(int nargs, char **args) {
     if (nargs == 2) {
-        log_set_level(atoi(args[1]));
+        klog_set_level(atoi(args[1]));
+        return 0;
+    }
+    return -1;
+}
+
+int do_load_persist_props(int nargs, char **args) {
+    if (nargs == 1) {
+        load_persist_props();
         return 0;
     }
     return -1;
@@ -562,6 +801,8 @@ int do_wait(int nargs, char **args)
 {
     if (nargs == 2) {
         return wait_for_file(args[1], COMMAND_RETRY_TIMEOUT);
-    }
-    return -1;
+    } else if (nargs == 3) {
+        return wait_for_file(args[1], atoi(args[2]));
+    } else
+        return -1;
 }

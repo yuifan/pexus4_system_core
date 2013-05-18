@@ -23,6 +23,8 @@
 #include <errno.h>
 #include <time.h>
 
+#include <selinux/label.h>
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -33,45 +35,9 @@
 
 #include <private/android_filesystem_config.h>
 
+#include "init.h"
 #include "log.h"
-#include "list.h"
 #include "util.h"
-
-static int log_fd = -1;
-/* Inital log level before init.rc is parsed and this this is reset. */
-static int log_level = LOG_DEFAULT_LEVEL;
-
-
-void log_set_level(int level) {
-    log_level = level;
-}
-
-void log_init(void)
-{
-    static const char *name = "/dev/__kmsg__";
-    if (mknod(name, S_IFCHR | 0600, (1 << 8) | 11) == 0) {
-        log_fd = open(name, O_WRONLY);
-        fcntl(log_fd, F_SETFD, FD_CLOEXEC);
-        unlink(name);
-    }
-}
-
-#define LOG_BUF_MAX 512
-
-void log_write(int level, const char *fmt, ...)
-{
-    char buf[LOG_BUF_MAX];
-    va_list ap;
-    
-    if (level > log_level) return;
-    if (log_fd < 0) return;
-    
-    va_start(ap, fmt);
-    vsnprintf(buf, LOG_BUF_MAX, fmt, ap);
-    buf[LOG_BUF_MAX - 1] = 0;
-    va_end(ap);
-    write(log_fd, buf, strlen(buf));
-}
 
 /*
  * android_name_to_id - returns the integer uid/gid associated with the given
@@ -79,7 +45,7 @@ void log_write(int level, const char *fmt, ...)
  */
 static unsigned int android_name_to_id(const char *name)
 {
-    struct android_id_info *info = android_ids;
+    const struct android_id_info *info = android_ids;
     unsigned int n;
 
     for (n = 0; n < android_id_count; n++) {
@@ -121,6 +87,7 @@ int create_socket(const char *name, int type, mode_t perm, uid_t uid, gid_t gid)
 {
     struct sockaddr_un addr;
     int fd, ret;
+    char *secon;
 
     fd = socket(PF_UNIX, type, 0);
     if (fd < 0) {
@@ -139,11 +106,21 @@ int create_socket(const char *name, int type, mode_t perm, uid_t uid, gid_t gid)
         goto out_close;
     }
 
+    secon = NULL;
+    if (sehandle) {
+        ret = selabel_lookup(sehandle, &secon, addr.sun_path, S_IFSOCK);
+        if (ret == 0)
+            setfscreatecon(secon);
+    }
+
     ret = bind(fd, (struct sockaddr *) &addr, sizeof (addr));
     if (ret) {
         ERROR("Failed to bind socket '%s': %s\n", name, strerror(errno));
         goto out_unlink;
     }
+
+    setfscreatecon(NULL);
+    freecon(secon);
 
     chown(addr.sun_path, uid, gid);
     chmod(addr.sun_path, perm);
@@ -166,10 +143,22 @@ void *read_file(const char *fn, unsigned *_sz)
     char *data;
     int sz;
     int fd;
+    struct stat sb;
 
     data = 0;
     fd = open(fn, O_RDONLY);
     if(fd < 0) return 0;
+
+    // for security reasons, disallow world-writable
+    // or group-writable files
+    if (fstat(fd, &sb) < 0) {
+        ERROR("fstat failed for '%s'\n", fn);
+        goto oops;
+    }
+    if ((sb.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        ERROR("skipping insecure file '%s'\n", fn);
+        goto oops;
+    }
 
     sz = lseek(fd, 0, SEEK_END);
     if(sz < 0) goto oops;
@@ -190,26 +179,6 @@ oops:
     close(fd);
     if(data != 0) free(data);
     return 0;
-}
-
-void list_init(struct listnode *node)
-{
-    node->next = node;
-    node->prev = node;
-}
-
-void list_add_tail(struct listnode *head, struct listnode *item)
-{
-    item->next = head;
-    item->prev = head->prev;
-    head->prev->next = item;
-    head->prev = item;
-}
-
-void list_remove(struct listnode *item)
-{
-    item->next->prev = item->prev;
-    item->prev->next = item->next;
 }
 
 #define MAX_MTD_PARTITIONS 16
@@ -325,12 +294,12 @@ int mkdir_recursive(const char *pathname, mode_t mode)
         memcpy(buf, pathname, width);
         buf[width] = 0;
         if (stat(buf, &info) != 0) {
-            ret = mkdir(buf, mode);
+            ret = make_dir(buf, mode);
             if (ret && errno != EEXIST)
                 return ret;
         }
     }
-    ret = mkdir(pathname, mode);
+    ret = make_dir(pathname, mode);
     if (ret && errno != EEXIST)
         return ret;
     return 0;
@@ -439,8 +408,9 @@ void get_hardware_name(char *hardware, unsigned int *revision)
         if (x) {
             x += 2;
             n = 0;
-            while (*x && !isspace(*x)) {
-                hardware[n++] = tolower(*x);
+            while (*x && *x != '\n') {
+                if (!isspace(*x))
+                    hardware[n++] = tolower(*x);
                 x++;
                 if (n == 31) break;
             }
@@ -454,4 +424,78 @@ void get_hardware_name(char *hardware, unsigned int *revision)
             *revision = strtoul(x + 2, 0, 16);
         }
     }
+}
+
+void import_kernel_cmdline(int in_qemu,
+                           void (*import_kernel_nv)(char *name, int in_qemu))
+{
+    char cmdline[1024];
+    char *ptr;
+    int fd;
+
+    fd = open("/proc/cmdline", O_RDONLY);
+    if (fd >= 0) {
+        int n = read(fd, cmdline, 1023);
+        if (n < 0) n = 0;
+
+        /* get rid of trailing newline, it happens */
+        if (n > 0 && cmdline[n-1] == '\n') n--;
+
+        cmdline[n] = 0;
+        close(fd);
+    } else {
+        cmdline[0] = 0;
+    }
+
+    ptr = cmdline;
+    while (ptr && *ptr) {
+        char *x = strchr(ptr, ' ');
+        if (x != 0) *x++ = 0;
+        import_kernel_nv(ptr, in_qemu);
+        ptr = x;
+    }
+}
+
+int make_dir(const char *path, mode_t mode)
+{
+    int rc;
+
+    char *secontext = NULL;
+
+    if (sehandle) {
+        selabel_lookup(sehandle, &secontext, path, mode);
+        setfscreatecon(secontext);
+    }
+
+    rc = mkdir(path, mode);
+
+    if (secontext) {
+        int save_errno = errno;
+        freecon(secontext);
+        setfscreatecon(NULL);
+        errno = save_errno;
+    }
+
+    return rc;
+}
+
+int restorecon(const char *pathname)
+{
+    char *secontext = NULL;
+    struct stat sb;
+    int i;
+
+    if (is_selinux_enabled() <= 0 || !sehandle)
+        return 0;
+
+    if (lstat(pathname, &sb) < 0)
+        return -errno;
+    if (selabel_lookup(sehandle, &secontext, pathname, sb.st_mode) < 0)
+        return -errno;
+    if (lsetfilecon(pathname, secontext) < 0) {
+        freecon(secontext);
+        return -errno;
+    }
+    freecon(secontext);
+    return 0;
 }
